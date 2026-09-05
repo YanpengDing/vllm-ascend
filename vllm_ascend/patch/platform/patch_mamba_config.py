@@ -9,16 +9,19 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
 
 
-def _is_sparse_glm5_next(model_config) -> bool:
+def _is_glm5_next_model(model_config) -> bool:
     text_config = getattr(model_config, "hf_text_config", None)
     model_types = {
         getattr(getattr(model_config, "hf_config", None), "model_type", None),
         getattr(text_config, "model_type", None),
     }
-    return (
-        bool(model_types & {"glm5_next", "glm5_next_text"})
-        and getattr(text_config, "index_topk", None) is not None
-    )
+    return bool(model_types & {"glm5_next", "glm5_next_text"})
+
+
+def _is_sparse_glm5_next(model_config) -> bool:
+    return _is_glm5_next_model(model_config) and getattr(
+        getattr(model_config, "hf_text_config", None), "index_topk", None
+    ) is not None
 
 
 def _using_kv_store(vllm_config) -> bool:
