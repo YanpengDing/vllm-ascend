@@ -22,10 +22,23 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
+from vllm_ascend.models.glm5next.cache_config import (
+    _get_glm5_cache_layout,
+    get_glm5_kv_cache_config,
+    get_glm5_kv_cache_groups,
+    get_glm5_max_memory_usage,
+    get_glm5_pool_bytes_per_block,
+)
+from vllm_ascend.models.glm5next.kv_cache import is_glm5_cache_spec
+
 _KIMI_K3_TARGET_LAYER_PREFIX = "language_model.model.layers."
 _KIMI_K3_DRAFT_LAYER_PREFIX = "model.layers."
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_get_kv_cache_groups_uniform_page_size = vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size
+_orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
+_orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
+_orig_max_memory_usage_bytes_from_groups = vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
+_orig_pool_bytes_per_block = vllm.v1.core.kv_cache_utils._pool_bytes_per_block
 
 
 if UniformTypeKVCacheSpecs.max_num_blocks_per_req is KVCacheSpec.max_num_blocks_per_req:
@@ -374,6 +387,47 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+def _get_glm5_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    if any(is_glm5_cache_spec(spec) for spec in kv_cache_spec.values()):
+        return get_glm5_kv_cache_groups(vllm_config, kv_cache_spec)
+    return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+
+def _get_glm5_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    if _get_glm5_cache_layout(kv_cache_groups) is not None:
+        return get_glm5_kv_cache_config(
+            vllm_config, kv_cache_groups, available_memory
+        )
+    return _orig_get_kv_cache_config_from_groups(
+        vllm_config, kv_cache_groups, available_memory
+    )
+
+
+def _get_glm5_max_memory_usage(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    if _get_glm5_cache_layout(kv_cache_groups) is not None:
+        return get_glm5_max_memory_usage(vllm_config, kv_cache_groups)
+    return _orig_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
+
+
+def _get_glm5_pool_bytes_per_block(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    if _get_glm5_cache_layout(kv_cache_groups) is not None:
+        return get_glm5_pool_bytes_per_block(kv_cache_groups)
+    return _orig_pool_bytes_per_block(vllm_config, kv_cache_groups)
+
+
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
@@ -382,6 +436,10 @@ vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size = _get_kv_cac
 # get_kv_cache_config_from_groups now calls _get_kv_cache_config_packed directly, bypassing
 # the alias patch above. Patch the canonical name so Ascend's non-packed layout is used.
 vllm.v1.core.kv_cache_utils._get_kv_cache_config_packed = _get_kv_cache_config_deepseek_v4
+vllm.v1.core.kv_cache_utils.get_kv_cache_groups = _get_glm5_kv_cache_groups
+vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = _get_glm5_kv_cache_config
+vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = _get_glm5_max_memory_usage
+vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _get_glm5_pool_bytes_per_block
 KVCacheConfig.has_mamba_layers = property(  # type: ignore[assignment]
     _kv_cache_config_has_mamba_layers
 )
