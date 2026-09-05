@@ -74,6 +74,9 @@ class AscendIndexerKPoolMetadata:
     block_size: int
     compress_ratio: int
     cache_role: str = "indexer"
+    cum_query_lens: torch.Tensor | None = None
+    raw_seq_lens: torch.Tensor | None = None
+    num_actual_tokens: int = 0
 
 
 class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
@@ -141,6 +144,16 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=device,
         )
+        self._cum_query_lens_buffer = torch.empty(
+            scheduler_config.max_num_seqs,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._raw_seq_lens_buffer = torch.empty(
+            scheduler_config.max_num_seqs,
+            dtype=torch.int32,
+            device=device,
+        )
         max_logical_blocks = cdiv(
             vllm_config.model_config.max_model_len,
             self.logical_block_size,
@@ -178,6 +191,14 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             self.compress_ratio,
             rounding_mode="floor",
             out=seq_lens,
+        )
+        cum_query_lens = self._cum_query_lens_buffer[:num_reqs]
+        cum_query_lens.copy_(
+            common_attn_metadata.query_start_loc[: num_reqs + 1][1:]
+        )
+        raw_seq_lens = self._raw_seq_lens_buffer[:num_reqs]
+        raw_seq_lens.copy_(
+            common_attn_metadata.seq_lens[:num_reqs]
         )
         if common_attn_metadata._seq_lens_cpu is not None:
             seq_lens_cpu = common_attn_metadata._seq_lens_cpu[:num_reqs]
@@ -243,6 +264,9 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             positions=positions,
             block_size=self.indexer_block_size,
             compress_ratio=self.compress_ratio,
+            cum_query_lens=cum_query_lens,
+            raw_seq_lens=raw_seq_lens,
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
         )
 
 

@@ -2,15 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-Next cache specs and compressed-cache addressing."""
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 import torch
 from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from vllm_ascend.attention.indexer_kpool import select_indexer_block_size
+from vllm_ascend.attention.indexer_kpool import (
+    AscendIndexerKPoolMetadataBuilder,
+    select_indexer_block_size,
+)
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.core.kv_cache_interface import register_ascend_kv_cache_specs
 from vllm_ascend.models.glm5next.kv_cache import (
     AscendIndexerKPoolStateSpec,
+    Glm5NextIndexerCache,
+    Glm5NextStateCache,
     format_indexer_kpool_slot_mapping,
 )
 
@@ -74,3 +84,89 @@ def test_indexer_block_size_selection(storage_block_size, expected):
 def test_invalid_indexer_block_size_is_rejected(storage_block_size):
     with pytest.raises(ValueError):
         select_indexer_block_size(storage_block_size)
+
+
+def test_model_cache_layers_publish_source_compatible_specs():
+    current_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    cache_config = SimpleNamespace(block_size=256)
+    with patch(
+        "vllm_ascend.models.glm5next.kv_cache.get_current_vllm_config",
+        return_value=current_config,
+    ):
+        indexer = Glm5NextIndexerCache(
+            head_dim=128,
+            dtype=torch.bfloat16,
+            cache_role="indexer",
+            cache_config=cache_config,
+            prefix="model.layers.0.indexer.k_cache",
+            compress_ratio=16,
+        )
+        state = Glm5NextStateCache(
+            state_dim=256,
+            dtype=torch.float32,
+            compress_ratio=16,
+            cache_config=cache_config,
+            prefix="model.layers.0.indexer.state_cache",
+        )
+
+    indexer_spec = indexer.get_kv_cache_spec(None)
+    state_spec = state.get_kv_cache_spec(None)
+    assert len(indexer.kv_cache) == len(state.kv_cache) == 2
+    assert indexer_spec.block_size == 256
+    assert indexer_spec.storage_block_size == 16
+    assert indexer_spec.compress_ratio == 16
+    assert indexer_spec.model_version == "glm5_next"
+    assert state_spec.block_size == state_spec.sliding_window == 16
+    assert state_spec.head_size == 256
+    assert state_spec.dtype == torch.float32
+    assert set(current_config.compilation_config.static_forward_context) == {
+        indexer.prefix,
+        state.prefix,
+    }
+
+
+def test_indexer_metadata_preserves_raw_request_boundaries():
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=16,
+            max_num_seqs=2,
+        ),
+        model_config=SimpleNamespace(max_model_len=512),
+    )
+    builder = AscendIndexerKPoolMetadataBuilder(
+        MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            compress_ratio=16,
+            model_version="glm5_next",
+        ),
+        ["model.layers.0.indexer.k_cache"],
+        config,
+        torch.device("cpu"),
+    )
+    common = AscendCommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2, 5], dtype=torch.int32),
+        seq_lens=torch.tensor([18, 35], dtype=torch.int32),
+        _seq_lens_cpu=torch.tensor([18, 35], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=5,
+        max_query_len=3,
+        num_input_tokens=5,
+        max_seq_len=35,
+        block_table_tensor=torch.tensor([[0, -1], [1, 2]], dtype=torch.int32),
+        slot_mapping=torch.tensor([16, 17, 32, 33, 34]),
+        positions=torch.tensor([16, 17, 32, 33, 34]),
+    )
+
+    metadata = builder.build(0, common)
+
+    assert metadata.cum_query_lens.tolist() == [2, 5]
+    assert metadata.raw_seq_lens.tolist() == [18, 35]
+    assert metadata.seq_lens.tolist() == [1, 2]
+    assert metadata.num_actual_tokens == 5
