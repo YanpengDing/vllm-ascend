@@ -7,13 +7,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.single_type_kv_cache_manager import (
+    register_all_kvcache_specs,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
     MLAAttentionSpec,
 )
 
-from vllm_ascend.core.kv_cache_interface import register_ascend_kv_cache_specs
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_cache_layout,
     get_glm5_kv_cache_config,
@@ -79,7 +81,8 @@ def make_specs(pool: int = 16):
 
 @pytest.fixture(autouse=True)
 def register_cache_specs():
-    register_ascend_kv_cache_specs()
+    # Match production: vLLM registers built-in specs before the Ascend hook.
+    register_all_kvcache_specs(None)
 
 
 @pytest.mark.parametrize("pool", [4, 16])

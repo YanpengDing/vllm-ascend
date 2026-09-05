@@ -330,8 +330,10 @@ def _get_glm5_cache_layout(
         )
 
     main_slot_count = max(
-        len(mla_names),
-        *(len(group.layer_names) for group in mamba_groups),
+        (
+            len(mla_names),
+            *(len(group.layer_names) for group in mamba_groups),
+        )
     )
     return _Glm5CacheLayout(
         full_group=full_group,
