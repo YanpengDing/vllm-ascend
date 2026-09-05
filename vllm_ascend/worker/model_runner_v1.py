@@ -150,6 +150,7 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.model_executor.offloader import create_offloader
+from vllm_ascend.models.glm5next.cache_config import _get_glm5_cache_layout
 from vllm_ascend.models.glm5next.kv_cache import KpoolTailSpec
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
@@ -4220,6 +4221,68 @@ class NPUModelRunner(GPUModelRunner):
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        glm5_layout = _get_glm5_cache_layout(kv_cache_config.kv_cache_groups)
+        if glm5_layout is not None:
+            self.hybrid_with_attn_and_mamba = False
+            if not kv_cache_config.kv_cache_tensors:
+                raise ValueError("GLM-Next KV cache plan has no physical tensors.")
+
+            sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
+            block_strides = {
+                tensor.block_stride
+                for tensor in kv_cache_config.kv_cache_tensors
+            }
+            if len(sizes) != 1 or len(block_strides) != 1:
+                raise ValueError(
+                    "GLM-Next KV cache descriptors must share one backing size "
+                    "and block stride."
+                )
+            backing_size = sizes.pop()
+            block_stride = block_strides.pop()
+            if block_stride <= 0:
+                raise ValueError(
+                    "GLM-Next KV cache descriptors require a positive block stride."
+                )
+            if backing_size != kv_cache_config.num_blocks * block_stride:
+                raise ValueError(
+                    "GLM-Next backing size does not match its block-major layout: "
+                    f"size={backing_size}, num_blocks={kv_cache_config.num_blocks}, "
+                    f"block_stride={block_stride}."
+                )
+
+            backing = self._allocate_int8_cache_tensor(backing_size, alignment)
+            for descriptor in kv_cache_config.kv_cache_tensors:
+                if descriptor.offset < 0 or descriptor.offset >= block_stride:
+                    raise ValueError(
+                        "GLM-Next cache descriptor offset is outside its physical "
+                        f"block: offset={descriptor.offset}, "
+                        f"block_stride={block_stride}."
+                    )
+                for layer_name in descriptor.shared_by:
+                    if layer_name in self.runner_only_attn_layers:
+                        continue
+                    if layer_name in kv_cache_raw_tensors:
+                        raise ValueError(
+                            f"GLM-Next cache layer {layer_name!r} has multiple "
+                            "physical descriptors."
+                        )
+                    kv_cache_raw_tensors[layer_name] = backing
+
+            expected_layers = {
+                layer_name
+                for group in kv_cache_config.kv_cache_groups
+                for layer_name in group.layer_names
+                if layer_name not in self.runner_only_attn_layers
+            }
+            allocated_layers = set(kv_cache_raw_tensors)
+            if expected_layers != allocated_layers:
+                raise AssertionError(
+                    "GLM-Next KV cache tensors are not correctly initialized: "
+                    f"missing={sorted(expected_layers - allocated_layers)}, "
+                    f"unexpected={sorted(allocated_layers - expected_layers)}."
+                )
+            return kv_cache_raw_tensors
+
         # If some tensors are shared by linear layers and attention layers,
         # the same tensor format must be maintained even if some layers
         # have only linear or attention layers, for example, the mtp layer.
@@ -4440,6 +4503,65 @@ class NPUModelRunner(GPUModelRunner):
             storage_offset_bytes += stride[0] * dtype_size
         return reshaped_kv_tensors
 
+    @staticmethod
+    def _reshape_glm5_pooled_cache_tensor(
+        raw_tensor: torch.Tensor,
+        cache_shape: tuple[int, ...],
+        dtype: torch.dtype,
+        block_stride_bytes: int,
+        block_offset_bytes: int,
+        payload_offset_bytes: int = 0,
+    ) -> torch.Tensor:
+        """Create one layer view over the GLM-Next block-major cache pool."""
+        if not cache_shape or cache_shape[0] <= 0:
+            raise ValueError(f"Invalid GLM-Next cache shape: {cache_shape}.")
+
+        dtype_size = get_dtype_size(dtype)
+        storage_offset_bytes = block_offset_bytes + payload_offset_bytes
+        if (
+            block_stride_bytes % dtype_size
+            or storage_offset_bytes % dtype_size
+        ):
+            raise ValueError(
+                "GLM-Next cache stride and offset must be aligned to "
+                f"{dtype}: block_stride={block_stride_bytes}, "
+                f"storage_offset={storage_offset_bytes}."
+            )
+
+        block_stride = block_stride_bytes // dtype_size
+        payload_numel = math.prod(cache_shape[1:])
+        block_end = (
+            storage_offset_bytes // dtype_size + payload_numel
+        )
+        if block_end > block_stride:
+            raise ValueError(
+                "GLM-Next cache payload crosses a physical block boundary: "
+                f"shape={cache_shape}, block_stride={block_stride_bytes}, "
+                f"block_offset={block_offset_bytes}, "
+                f"payload_offset={payload_offset_bytes}."
+            )
+
+        typed_tensor = raw_tensor.view(dtype)
+        relative_offset = storage_offset_bytes // dtype_size
+        required_numel = (
+            relative_offset
+            + (cache_shape[0] - 1) * block_stride
+            + payload_numel
+        )
+        if required_numel > typed_tensor.numel():
+            raise ValueError(
+                "GLM-Next backing tensor is too small for its pooled view: "
+                f"required={required_numel}, available={typed_tensor.numel()}."
+            )
+
+        inner_strides = torch.empty(cache_shape[1:]).stride()
+        return torch.as_strided(
+            typed_tensor,
+            size=cache_shape,
+            stride=(block_stride, *inner_strides),
+            storage_offset=typed_tensor.storage_offset() + relative_offset,
+        )
+
 
     def _reshape_kv_cache_tensors(
         self,
@@ -4459,6 +4581,18 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        glm5_layout = _get_glm5_cache_layout(kv_cache_config.kv_cache_groups)
+        glm5_descriptors = {}
+        if glm5_layout is not None:
+            for descriptor in kv_cache_config.kv_cache_tensors:
+                for layer_name in descriptor.shared_by:
+                    if layer_name in glm5_descriptors:
+                        raise ValueError(
+                            f"GLM-Next cache layer {layer_name!r} has multiple "
+                            "physical descriptors."
+                        )
+                    glm5_descriptors[layer_name] = descriptor
+
         for group in self._kv_cache_spec_attn_group_iterator():
             attn_backend = group.backend
             current_kv_cache_spec = group.kv_cache_spec
@@ -4467,6 +4601,178 @@ class NPUModelRunner(GPUModelRunner):
                     continue
 
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+                if layer_name in glm5_descriptors:
+                    descriptor = glm5_descriptors[layer_name]
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    if not isinstance(raw_tensor, torch.Tensor):
+                        raise TypeError(
+                            "GLM-Next pooled cache layers require one raw backing "
+                            f"tensor, got {type(raw_tensor).__name__} for "
+                            f"{layer_name}."
+                        )
+                    if raw_tensor.numel() != descriptor.size:
+                        raise ValueError(
+                            "GLM-Next raw cache size does not match its descriptor: "
+                            f"layer={layer_name}, raw={raw_tensor.numel()}, "
+                            f"descriptor={descriptor.size}."
+                        )
+                    if (
+                        descriptor.block_stride <= 0
+                        or descriptor.offset < 0
+                        or descriptor.offset
+                        + current_kv_cache_spec.page_size_bytes
+                        > descriptor.block_stride
+                    ):
+                        raise ValueError(
+                            "GLM-Next cache page is outside its physical block: "
+                            f"layer={layer_name}, offset={descriptor.offset}, "
+                            "page_size="
+                            f"{current_kv_cache_spec.page_size_bytes}, "
+                            f"block_stride={descriptor.block_stride}."
+                        )
+
+                    if isinstance(current_kv_cache_spec, MambaSpec):
+                        state_tensors = []
+                        payload_offset = 0
+                        for shape, dtype in zip(
+                            current_kv_cache_spec.shapes,
+                            current_kv_cache_spec.dtypes,
+                        ):
+                            target_shape = (kv_cache_config.num_blocks, *shape)
+                            state_tensors.append(
+                                self._reshape_glm5_pooled_cache_tensor(
+                                    raw_tensor,
+                                    target_shape,
+                                    dtype,
+                                    descriptor.block_stride,
+                                    descriptor.offset,
+                                    payload_offset,
+                                )
+                            )
+                            payload_offset += (
+                                math.prod(shape) * get_dtype_size(dtype)
+                            )
+                        if payload_offset > current_kv_cache_spec.page_size_bytes:
+                            raise ValueError(
+                                "GLM-Next Mamba states exceed their physical page: "
+                                f"layer={layer_name}, payload={payload_offset}, "
+                                "page_size="
+                                f"{current_kv_cache_spec.page_size_bytes}."
+                            )
+                        kv_caches[layer_name] = state_tensors
+                        continue
+
+                    if not isinstance(current_kv_cache_spec, AttentionSpec):
+                        raise TypeError(
+                            "Unsupported GLM-Next pooled cache spec for "
+                            f"{layer_name}: {type(current_kv_cache_spec).__name__}."
+                        )
+                    storage_block_size = getattr(
+                        current_kv_cache_spec,
+                        "storage_block_size",
+                        current_kv_cache_spec.block_size,
+                    )
+                    # Keep one scheduler block in dimension 0. A pooled page
+                    # is followed by other layers' pages, so virtual kernel
+                    # blocks cannot be flattened across that physical gap.
+                    is_quantized_indexer = (
+                        current_kv_cache_spec.compress_ratio > 1
+                        and current_kv_cache_spec.dtype == torch.uint8
+                    )
+                    if is_quantized_indexer:
+                        indexer_head_size = (
+                            current_kv_cache_spec.head_size
+                            - get_dtype_size(torch.float16)
+                        )
+                        cache_shape = attn_backend.get_kv_cache_shape(
+                            kv_cache_config.num_blocks,
+                            storage_block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            indexer_head_size,
+                        )
+                        scale_shape = attn_backend.get_kv_cache_shape(
+                            kv_cache_config.num_blocks,
+                            storage_block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            1,
+                        )
+                        indexer_payload_size = (
+                            math.prod(cache_shape[1:])
+                            * get_dtype_size(torch.int8)
+                        )
+                        scale_payload_size = (
+                            math.prod(scale_shape[1:])
+                            * get_dtype_size(torch.float16)
+                        )
+                        if (
+                            indexer_payload_size + scale_payload_size
+                            > current_kv_cache_spec.page_size_bytes
+                        ):
+                            raise ValueError(
+                                "GLM-Next quantized indexer payload exceeds its "
+                                f"physical page for {layer_name}."
+                            )
+                        kv_caches[layer_name] = [
+                            self._reshape_glm5_pooled_cache_tensor(
+                                raw_tensor,
+                                cache_shape,
+                                torch.int8,
+                                descriptor.block_stride,
+                                descriptor.offset,
+                            ),
+                            self._reshape_glm5_pooled_cache_tensor(
+                                raw_tensor,
+                                scale_shape,
+                                torch.float16,
+                                descriptor.block_stride,
+                                descriptor.offset,
+                                indexer_payload_size,
+                            ),
+                        ]
+                        continue
+
+                    try:
+                        cache_shape = attn_backend.get_kv_cache_shape(
+                            kv_cache_config.num_blocks,
+                            storage_block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            current_kv_cache_spec.head_size,
+                            cache_dtype_str=getattr(
+                                current_kv_cache_spec,
+                                "cache_dtype_str",
+                                "auto",
+                            )
+                            or "auto",
+                        )
+                    except TypeError:
+                        cache_shape = attn_backend.get_kv_cache_shape(
+                            kv_cache_config.num_blocks,
+                            storage_block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            current_kv_cache_spec.head_size,
+                        )
+                    payload_size = (
+                        math.prod(cache_shape[1:])
+                        * get_dtype_size(current_kv_cache_spec.dtype)
+                    )
+                    if payload_size > current_kv_cache_spec.page_size_bytes:
+                        raise ValueError(
+                            "GLM-Next cache payload exceeds its physical page: "
+                            f"layer={layer_name}, payload={payload_size}, "
+                            "page_size="
+                            f"{current_kv_cache_spec.page_size_bytes}."
+                        )
+                    kv_caches[layer_name] = (
+                        self._reshape_glm5_pooled_cache_tensor(
+                            raw_tensor,
+                            cache_shape,
+                            current_kv_cache_spec.dtype,
+                            descriptor.block_stride,
+                            descriptor.offset,
+                        )
+                    )
+                    continue
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
