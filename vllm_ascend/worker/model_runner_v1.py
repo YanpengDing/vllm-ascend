@@ -151,7 +151,6 @@ from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.models.glm5next.cache_config import _get_glm5_cache_layout
-from vllm_ascend.models.glm5next.kv_cache import KpoolTailSpec
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
@@ -4095,7 +4094,10 @@ class NPUModelRunner(GPUModelRunner):
         static_ctx = getattr(compilation_config, "static_forward_context", {}) if compilation_config else {}
         if is_glm5_next_kpool_cache(static_ctx.get(layer_name)):
             return True
-        return isinstance(spec, KpoolTailSpec)
+        return getattr(spec, "model_version", None) == "glm5_next" and (
+            getattr(spec, "compress_ratio", 1) > 1
+            or getattr(spec, "cache_role", None) == "indexer_state"
+        )
 
     def _get_attention_kv_cache_dims(self, layer_name: str, kv_cache_spec: AttentionSpec) -> tuple[int, int]:
         if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
@@ -5436,11 +5438,11 @@ class NPUModelRunner(GPUModelRunner):
                     attn_layer_names.add(layer_name)
 
             elif isinstance(attn_module, DeepseekV32IndexerCache):
-                # GLM-5.3-Flash kpool indexer/tail caches subclass the DeepSeek
-                # V3.2 indexer cache but keep compress_ratio / KpoolTailSpec.
+                # Retain compatibility with legacy GLM kpool modules that
+                # subclassed the DeepSeek V3.2 indexer cache.
                 if is_glm5_next_kpool_cache(attn_module):
                     if spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                        # Indexer/tail pages do not evenly divide the MLA page.
+                        # Indexer pages do not evenly divide the MLA page.
                         # Ascend indexes KV by block stride, so opt in to padding.
                         if isinstance(spec, AttentionSpec):
                             spec = replace(spec, indexes_kv_by_block_stride=True)
