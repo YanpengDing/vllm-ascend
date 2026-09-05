@@ -243,10 +243,19 @@ def register_ascend_kv_cache_specs() -> None:
     )
 
     # Imported lazily so this module stays independent of any single model.
-    from vllm_ascend.models.glm5next.kv_cache import KpoolTailManager, KpoolTailSpec
+    from vllm_ascend.models.glm5next.kv_cache import (
+        AscendIndexerKPoolStateSpec,
+        KpoolTailManager,
+        KpoolTailSpec,
+    )
 
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=KpoolTailSpec,
         manager_class=KpoolTailManager,
         uniform_type_base_spec=KpoolTailSpec,
+    )
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendIndexerKPoolStateSpec,
+        manager_class=SlidingWindowManager,
+        uniform_type_base_spec=SlidingWindowMLASpec,
     )

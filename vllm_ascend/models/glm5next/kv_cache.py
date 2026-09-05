@@ -19,12 +19,20 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import ClassVar
 
+import torch
+from typing_extensions import Self
 from vllm.config import VllmConfig
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec
 from vllm.v1.request import Request
+
+from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+
+
+def is_glm5_cache_spec(spec: KVCacheSpec) -> bool:
+    return getattr(spec, "model_version", None) == "glm5_next"
 
 
 class KpoolTailManager(FullAttentionManager):
@@ -166,3 +174,54 @@ class KpoolTailSpec(SlidingWindowSpec):
     @property
     def participates_in_prefix_caching(self) -> bool:
         return False
+
+
+@dataclass(frozen=True, kw_only=True)
+class AscendIndexerKPoolStateSpec(AscendSlidingWindowMLASpec):
+    """Paged FP32 state used by the GLM-Next indexer compressor."""
+
+    cache_role: str = "indexer_state"
+    model_version: str = "glm5_next"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.dtype != torch.float32:
+            raise ValueError(f"GLM-Next compressor state must use FP32, got {self.dtype}.")
+        if self.block_size != self.sliding_window:
+            raise ValueError(
+                "GLM-Next compressor state requires block_size == "
+                f"sliding_window, got {self.block_size} and {self.sliding_window}."
+            )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, cls) for spec in specs)
+        assert all(spec == specs[0] for spec in specs[1:]), (
+            "All GLM-Next compressor-state layers in one cache group must "
+            "have the same layout and cache role."
+        )
+        return specs[0]
+
+
+def format_indexer_kpool_slot_mapping(
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    logical_block_size: int,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Map completed token pools onto the compressed indexer cache."""
+    if compress_ratio <= 1 or logical_block_size <= 0 or logical_block_size % compress_ratio:
+        raise ValueError(
+            f"logical_block_size={logical_block_size} must be divisible by "
+            f"compress_ratio={compress_ratio}."
+        )
+    valid = (slot_mapping >= 0) & (torch.remainder(positions + 1, compress_ratio) == 0)
+    safe_slots = slot_mapping.clamp_min(0)
+    block_ids = torch.div(safe_slots, logical_block_size, rounding_mode="floor")
+    offsets = torch.remainder(safe_slots, logical_block_size)
+    compressed_slots = block_ids * (logical_block_size // compress_ratio) + torch.div(
+        offsets,
+        compress_ratio,
+        rounding_mode="floor",
+    )
+    return torch.where(valid, compressed_slots, torch.full_like(compressed_slots, -1))
