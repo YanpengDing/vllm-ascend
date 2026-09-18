@@ -1,24 +1,32 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from PIL import Image
 from torch import nn
 from vllm.model_executor.models.interfaces import requires_raw_input_tokens, supports_multimodal
-from vllm.models.deepseek_v4_1.common.mm_preprocess import (
-    COMPRESS_PAD_TO,
-    IMAGE,
-    IMAGE_END,
-    IMAGE_NEW_LINE,
-    IMAGE_PAD_ID,
-    IMAGE_SENTINEL_BASE_ID,
-    IMAGE_START,
-    DeepseekV4VLProcessingInfo,
-    DeepseekV4VLProcessor,
-    image_sentinel_mask,
-    image_token_types,
-)
 from vllm.multimodal.processing import InputProcessingContext
-from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config as UpstreamDeepseekV41Config
+
+try:
+    from vllm.models.deepseek_v4_1.common.mm_preprocess import (
+        COMPRESS_PAD_TO,
+        IMAGE,
+        IMAGE_END,
+        IMAGE_NEW_LINE,
+        IMAGE_PAD_ID,
+        IMAGE_SENTINEL_BASE_ID,
+        IMAGE_START,
+        DeepseekV4VLProcessingInfo,
+        DeepseekV4VLProcessor,
+        image_sentinel_mask,
+        image_token_types,
+    )
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config as UpstreamDeepseekV41Config
+except ImportError:  # pragma: no cover - DeepSeek V4.1 requires vLLM main.
+    pytest.skip(
+        "DeepSeek V4.1 tests require vLLM main.",
+        allow_module_level=True,
+    )
 
 from vllm_ascend.models.deepseek_v41.engram.common import (
     valid_engram_token_mask,

@@ -3,7 +3,14 @@
 
 import pytest
 import torch
-from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+
+try:
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+except ImportError:  # pragma: no cover - DeepSeek V4.1 requires vLLM main.
+    pytest.skip(
+        "DeepSeek V4.1 tests require vLLM main.",
+        allow_module_level=True,
+    )
 
 from vllm_ascend.models.deepseek_v41.model import (
     DeepseekV41SharedAttentionState,

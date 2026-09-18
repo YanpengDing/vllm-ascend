@@ -9,9 +9,16 @@ import pytest
 import torch
 import torch_npu
 from vllm.config import set_current_vllm_config
-from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
 from vllm.v1.core import kv_cache_utils
-from vllm.v1.kv_cache_interface import CircularBufferSpec
+
+try:
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
+except ImportError:  # pragma: no cover - DeepSeek V4.1 requires vLLM main.
+    pytest.skip(
+        "DeepSeek V4.1 cache tests require vLLM main.",
+        allow_module_level=True,
+    )
 
 from tests.deepseek_v41_utils import (
     allocate_cache_views,

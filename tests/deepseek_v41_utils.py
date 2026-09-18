@@ -5,9 +5,17 @@
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 import torch.nn.functional as F
-from vllm.v1.kv_cache_interface import CircularBufferSpec
+
+try:
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
+except ImportError:  # pragma: no cover - vLLM v0.28.0 has no circular buffers.
+    pytest.skip(
+        "DeepSeek V4.1 cache specs require vLLM main (CircularBufferSpec is main-only).",
+        allow_module_level=True,
+    )
 
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,

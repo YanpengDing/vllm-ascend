@@ -5,7 +5,11 @@ import pytest
 from transformers import Qwen3Config
 from vllm.config.model_arch import ModelArchitectureConfig
 from vllm.config.speculative import SpeculativeConfig
-from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+
+try:
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+except ImportError:  # pragma: no cover - DeepSeek V4.1 requires vLLM main.
+    DeepseekV41Config = None
 
 from vllm_ascend.patch.platform import patch_speculative_config
 from vllm_ascend.patch.platform.patch_speculative_config import (
@@ -195,6 +199,8 @@ def test_deepseek_v41_dspark_selects_v41_drafter_and_expert_shape(flattened):
     )
     hf_config.update = lambda values: hf_config.__dict__.update(values)
     if flattened:
+        if DeepseekV41Config is None:
+            pytest.skip("DeepSeek V4.1 config requires vLLM main.")
         hf_config = DeepseekV41Config(
             text_config={
                 "dspark_target_layer_ids": [37, 38, 39],

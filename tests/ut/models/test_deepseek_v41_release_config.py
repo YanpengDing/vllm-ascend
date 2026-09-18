@@ -1,8 +1,16 @@
 import json
 
+import pytest
 from vllm import ModelRegistry
 from vllm.transformers_utils.config import get_config
-from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config as UpstreamDeepseekV41Config
+
+try:
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config as UpstreamDeepseekV41Config
+except ImportError:  # pragma: no cover - DeepSeek V4.1 requires vLLM main.
+    pytest.skip(
+        "DeepSeek V4.1 tests require vLLM main.",
+        allow_module_level=True,
+    )
 
 from vllm_ascend.models import register_model
 from vllm_ascend.utils import normalize_deepseek_v41_config

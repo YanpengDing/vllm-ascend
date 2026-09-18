@@ -7,14 +7,21 @@ import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheGroupSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+
+try:
+    from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
+except ImportError:  # pragma: no cover - vLLM v0.28.0 has no circular buffers.
+    pytest.skip(
+        "Circular buffer cache specs require vLLM main.",
+        allow_module_level=True,
+    )
 
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec, is_prefix_cacheable
 from vllm_ascend.patch.platform.patch_kv_cache_coordinator import AscendHybridKVCacheCoordinator

@@ -11,11 +11,6 @@ physical page table, and the mirror stays on the host.
 
 import numpy as np
 import torch
-from vllm.models.deepseek_v4_1.common.engram import (
-    EngramLayout,
-    build_compressed_token_map,
-    compute_hash_multipliers,
-)
 
 _HISTORY_SLAB_MIN_TOKENS = 16
 _PAGE_WRITE_NUMPY_MIN_TOKENS = 16
@@ -45,6 +40,15 @@ class PagedNgramHistory:
     """
 
     def __init__(self, config, tokenizer):
+        # DeepSeek V4.1 Engram lives in vLLM main only. Importing it lazily keeps
+        # this module importable on the v0.28.0 release lane, where the class is
+        # never constructed because the checkpoint cannot be loaded either.
+        from vllm.models.deepseek_v4_1.common.engram import (
+            EngramLayout,
+            build_compressed_token_map,
+            compute_hash_multipliers,
+        )
+
         layout = EngramLayout.from_config(config)
         assert layout is not None, "Paged history requires at least one Engram layer"
         token_map, compressed_vocab_size = build_compressed_token_map(tokenizer)
